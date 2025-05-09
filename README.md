@@ -10,7 +10,7 @@ This project delivers a **proactive AI assistant** that analyzes trading behavio
 
 ```bash
 git clone https://github.com/sevamahapat/AITradingBot.git
-cd ai-trading-bot
+cd AITradingBot
 ```
 
 ### 2. Create Virtual Environment
