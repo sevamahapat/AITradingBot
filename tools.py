@@ -6,6 +6,7 @@ from langchain.tools import tool
 
 df = None
 
+# Stores the loaded DataFrame globally for tool access.
 def set_dataframe(dataframe):
     global df
     df = dataframe
@@ -18,14 +19,32 @@ def get_total_deposits() -> str:
 
 @tool
 def get_most_profitable_trade() -> str:
-    """Finds the most profitable trade."""
-    trades = df[df["Trans Code"] != "ACH"]
-    top = trades[trades["Amount_clean"] > 0].sort_values(by="Amount_clean", ascending=False).head(1)
-    if not top.empty:
-        desc = top.iloc[0]["Description"]
-        amt = top.iloc[0]["Amount_clean"]
-        return f"Most profitable trade: {desc}, Profit: ${amt:.2f}"
-    return "No profitable trades found."
+    """Finds the most profitable trade based on net gain from matched BTO (Buy To Open) and STC (Sell To Close) trades."""
+    
+    trades = df[df["Trans Code"].isin(["BTO", "STC"])].copy()
+
+    # Group trades by description
+    grouped = trades.groupby("Description")
+
+    trade_profits = []
+
+    for desc, group in grouped:
+        buy_total = group[group["Trans Code"] == "BTO"]["Amount_clean"].sum()
+        sell_total = group[group["Trans Code"] == "STC"]["Amount_clean"].sum()
+
+        # Profit = Sell - Buy
+        if buy_total < 0 and sell_total > 0:
+            profit = sell_total + buy_total
+            trade_profits.append((desc, profit))
+
+    if not trade_profits:
+        return "No profitable trades found."
+
+    # Find trade with highest profit
+    most_profitable = max(trade_profits, key=lambda x: x[1])
+    desc, profit = most_profitable
+
+    return f"Most profitable trade: {desc}, Profit: ${profit:.2f}"
 
 @tool
 def calculate_expiry_loss_percentage() -> str:
@@ -52,13 +71,13 @@ def get_risk_advice() -> str:
     """Provides risk management advice based on trade activity."""
     advice = []
 
-    trades = df[df["Trans Code"] != "ACH"].copy()
-    trades = trades[pd.to_numeric(trades["Amount_clean"], errors="coerce").notnull()]
-    capital = df[df["Trans Code"] == "ACH"]["Amount_clean"].sum()
+    trades = df[df["Trans Code"] != "ACH"].copy() # Removes deposit entries (ACH) to get only trades.
+    trades = trades[pd.to_numeric(trades["Amount_clean"], errors="coerce").notnull()] # Ensures Amount_clean is numeric for all trade rows and avoids nulls.
+    capital = df[df["Trans Code"] == "ACH"]["Amount_clean"].sum() # Computes the total deposited capital. Useful for position sizing risk.
     
     # Win/Loss Ratio
-    gains = trades[trades["Amount_clean"] > 0]["Amount_clean"]
-    losses = trades[trades["Amount_clean"] < 0]["Amount_clean"]
+    gains = trades[trades["Amount_clean"] > 0]["Amount_clean"] # positive trades
+    losses = trades[trades["Amount_clean"] < 0]["Amount_clean"] # negative trades
     
     win_loss_ratio = len(gains) / len(losses) if len(losses) > 0 else float('inf')
     if win_loss_ratio < 1:
@@ -72,6 +91,7 @@ def get_risk_advice() -> str:
 
     # Position Sizing Analysis
     if capital > 0:
+        # Flags trades where the position size is more than 10% of your account.
         high_risk_trades = trades[abs(trades["Amount_clean"]) > 0.1 * capital]
         high_risk_pct = len(high_risk_trades) / len(trades)
         if high_risk_pct > 0:
@@ -79,7 +99,7 @@ def get_risk_advice() -> str:
 
     # Trade Variability
     if len(gains) >= 3:
-        std_return = gains.std()
+        std_return = gains.std() # Standard deviation of gains
         if std_return > avg_gain:
             advice.append(f"- Your returns show high variability (${std_return:.2f} STD). Aim for more consistent outcomes.")
     
@@ -102,6 +122,7 @@ def get_risk_advice() -> str:
 
     # Risk-Reward Ratio
     rr_ratios = []
+    # Pairs BTO (Buy) and STC (Sell) trades to compute reward/risk ratio.
     grouped = trades.groupby("Description")
     for desc, group in grouped:
         buy = group[group["Trans Code"] == "BTO"]["Amount_clean"].sum()
@@ -109,10 +130,11 @@ def get_risk_advice() -> str:
         if buy < 0 and sell > 0:
             rr = sell / abs(buy)
             rr_ratios.append(rr)
+    # If reward is low compared to risk, trade quality is poor.
     if rr_ratios:
         avg_rr = sum(rr_ratios) / len(rr_ratios)
         if avg_rr < 1.5:
-            advice.append(f"- Average reward-to-risk ratio is {avg_rr:.2f}. Target trades with R:R ≥ 2.0.")
+            advice.append(f"- Average reward-to-risk ratio is {avg_rr:.2f}. Target trades with R:R >= 2.0.")
 
     # Behavioral Trend: Revenge Trading
     trades_sorted = trades.sort_values(by="Activity Date")
@@ -128,22 +150,24 @@ def get_risk_advice() -> str:
 
     # Drawdown Analysis
     df_bal = df[["Activity Date", "Amount_clean"]].dropna()
+    # Groups by date and computes cumulative sum to get balance over time.
     df_bal = df_bal.groupby("Activity Date").sum().cumsum().reset_index()
+    # Renames columns for Prophet compatibility (ds = date, y = value)
     df_bal.columns = ["ds", "y"]
+    # Computes the running peak balance (highest value reached up to each day)
     peak = df_bal["y"].cummax()
-    drawdown = (df_bal["y"] - peak) / peak
+    # Measures decline from peak at each point.
+    drawdown = (df_bal["y"] - peak) / peak # all negative values representing drops.
+    # Finds the maximum drawdown (largest drop from peak) -> worst equity fall
     max_drawdown = drawdown.min()
     if max_drawdown < -0.2:
         advice.append(f"- Max drawdown was {abs(max_drawdown)*100:.2f}%. Consider pausing or downsizing during losing streaks.")
 
     # Forecasting
     try:
-        df_forecast = df[["Activity Date", "Amount_clean"]].dropna()
-        daily = df_forecast.groupby("Activity Date").sum().cumsum().reset_index()
-        daily.columns = ["ds", "y"]
-
         model = Prophet()
-        model.fit(daily)
+        model.fit(df_bal)
+        # Forecast account trend for the next 7 days
         future = model.make_future_dataframe(periods=7)
         forecast = model.predict(future)
         trend = forecast["yhat"].diff().tail(7).mean()
@@ -167,7 +191,7 @@ def deep_insight(total_deposits: str, most_profitable_trade: str, expiry_loss: s
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.7)
 
     prompt = f"""
-    You are a senior trading coach AI. You've received this report from an automated analysis system:
+    You are a senior trading coach AI. You have received this report from an automated analysis system:
 
     1. Total Deposits:\n{total_deposits}
     2. Most Profitable Trade:\n{most_profitable_trade}
